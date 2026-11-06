@@ -1,0 +1,767 @@
+// ==================== 配置 ====================
+// 使用 Bangumi 番组计划 API，直接返回按星期分组的番剧数据，且包含中文名
+const BANGUMI_API = 'https://api.bgm.tv/calendar';
+
+const WEEKDAYS = [
+  { cn: '周一' },
+  { cn: '周二' },
+  { cn: '周三' },
+  { cn: '周四' },
+  { cn: '周五' },
+  { cn: '周六' },
+  { cn: '周日' },
+];
+
+// 当前选中的天
+let selectedDay = 0;
+let cachedData = null;
+// 快照里的剧集播出表（id → [[集数, 'YYYY-MM-DD'], ...]），实时数据渲染时也复用
+let snapshotSchedules = null;
+
+// ==================== 共享配置（excluded.json）====================
+// 仓库根目录的共享配置文件，所有访客打开页面都会读取。
+// 本机 localStorage 的改动只对自己生效；点“发布配置”导出后写入该文件并推送，其他人才看得到。
+const REMOTE_CONFIG_URL = 'excluded.json';
+let remoteConfig = { deleted: [], hidden: [], episodeOverride: {}, linkOverride: {} };
+
+// ==================== 本地数据快照 ====================
+// data/calendar.json 由 scripts/fetch-data.js 生成，随仓库发布。
+// 页面优先用它渲染（国内网络访问不了 Bangumi 时也能打开），随后后台尝试实时接口并静默替换。
+const SNAPSHOT_URL = 'data/calendar.json';
+
+async function loadRemoteConfig() {
+  try {
+    const res = await fetch(`${REMOTE_CONFIG_URL}?v=${Date.now()}`, { cache: 'no-store' });
+    if (!res.ok) return;
+    const json = await res.json();
+    remoteConfig = {
+      deleted: Array.isArray(json.deleted) ? json.deleted.map(Number) : [],
+      hidden: Array.isArray(json.hidden) ? json.hidden.map(Number) : [],
+      episodeOverride: (json.episodeOverride && typeof json.episodeOverride === 'object') ? json.episodeOverride : {},
+      linkOverride: (json.linkOverride && typeof json.linkOverride === 'object') ? json.linkOverride : {},
+    };
+  } catch (err) {
+    // 未部署 / 离线 / 用 file:// 打开时会失败，属正常，忽略即可
+    console.warn('共享配置加载失败（离线或未部署时正常）：', err);
+  }
+}
+
+// ==================== 隐藏/删除列表管理 ====================
+const HIDDEN_KEY = 'anime_hidden_ids';
+const DELETED_KEY = 'anime_deleted_ids';
+
+function readLocalSet(key) {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(key) || '[]'));
+  } catch { return new Set(); }
+}
+
+function saveHiddenIds(idSet) {
+  localStorage.setItem(HIDDEN_KEY, JSON.stringify([...idSet]));
+}
+
+function saveDeletedIds(idSet) {
+  localStorage.setItem(DELETED_KEY, JSON.stringify([...idSet]));
+}
+
+// 仅本机改动（不含共享配置）
+function getLocalHiddenIds() { return readLocalSet(HIDDEN_KEY); }
+function getLocalDeletedIds() { return readLocalSet(DELETED_KEY); }
+
+// 最终生效 = 共享配置 ∪ 本机改动
+function getHiddenIds() { return new Set([...remoteConfig.hidden, ...getLocalHiddenIds()]); }
+function getDeletedIds() { return new Set([...remoteConfig.deleted, ...getLocalDeletedIds()]); }
+
+// ==================== 集数手动覆盖 ====================
+const EP_OVERRIDE_KEY = 'anime_episode_override';
+
+function getLocalEpisodeOverrides() {
+  try { return JSON.parse(localStorage.getItem(EP_OVERRIDE_KEY) || '{}'); }
+  catch { return {}; }
+}
+
+// 最终生效 = 共享配置打底，本机覆盖优先
+function getEpisodeOverrides() {
+  return { ...remoteConfig.episodeOverride, ...getLocalEpisodeOverrides() };
+}
+
+function setEpisodeOverride(id, ep) {
+  const map = getLocalEpisodeOverrides();
+  if (ep > 0) map[id] = ep; else delete map[id];
+  localStorage.setItem(EP_OVERRIDE_KEY, JSON.stringify(map));
+}
+
+// ==================== 自定义链接 ====================
+const LINK_OVERRIDE_KEY = 'anime_link_override';
+
+function getLocalLinkOverrides() {
+  try { return JSON.parse(localStorage.getItem(LINK_OVERRIDE_KEY) || '{}'); }
+  catch { return {}; }
+}
+
+function getLinkOverrides() {
+  return { ...remoteConfig.linkOverride, ...getLocalLinkOverrides() };
+}
+
+function setLinkOverride(id, url) {
+  const map = getLocalLinkOverrides();
+  const clean = (url || '').trim().replace(/^http:/, 'https:');
+  if (/^https?:\/\//i.test(clean)) map[id] = clean; else delete map[id];
+  localStorage.setItem(LINK_OVERRIDE_KEY, JSON.stringify(map));
+}
+
+function getDetailUrl(anime) {
+  const custom = getLinkOverrides()[anime.id];
+  if (custom) return custom;
+  return (anime.url || `https://bgm.tv/subject/${anime.id}`).replace(/^http:/, 'https:');
+}
+
+function editLink(id) {
+  const overrides = getLinkOverrides();
+  const input = prompt('设置自定义链接（需以 http:// 或 https:// 开头；留空或取消=恢复默认 Bangumi 链接）：', overrides[id] || '');
+  if (input === null) return;
+  if ((input || '').trim() !== '' && !/^https?:\/\//i.test((input || '').trim())) {
+    alert('链接无效，已恢复默认。链接需以 http:// 或 https:// 开头。');
+  }
+  setLinkOverride(id, input);
+  if (cachedData) {
+    updateWeekdayCounts(cachedData);
+    renderDay(cachedData);
+  }
+}
+
+function toggleHide(id) {
+  const ids = getLocalHiddenIds();
+  if (ids.has(id)) ids.delete(id);
+  else ids.add(id);
+  saveHiddenIds(ids);
+  if (cachedData) {
+    updateWeekdayCounts(cachedData);
+    renderDay(cachedData);
+  }
+}
+
+function deleteAnime(id) {
+  const ids = getLocalDeletedIds();
+  ids.add(id);
+  saveDeletedIds(ids);
+  // 同时从隐藏列表中移除
+  const hidden = getLocalHiddenIds();
+  hidden.delete(id);
+  saveHiddenIds(hidden);
+  if (cachedData) {
+    updateWeekdayCounts(cachedData);
+    renderDay(cachedData);
+  }
+}
+
+function restoreAnime(id) {
+  const ids = getLocalDeletedIds();
+  ids.delete(id);
+  saveDeletedIds(ids);
+  if (cachedData) {
+    updateWeekdayCounts(cachedData);
+    renderDay(cachedData);
+    openTrashModal(); // 刷新回收站弹窗
+  }
+}
+
+// 过滤掉隐藏、删除和非日漫的番剧
+function filterVisible(animeList) {
+  const hidden = getHiddenIds();
+  const deleted = getDeletedIds();
+  return animeList.filter(a => !hidden.has(a.id) && !deleted.has(a.id) && isJapaneseAnime(a));
+}
+
+// 国漫关键词黑名单（名字含这些词的不是日漫）
+const CN_NAME_PATTERNS = ['大理寺', '狂王', '肥志', '熊出没', '宝可梦动画图鉴', '云岫'];
+
+// 判断是否为日漫：通过假名和日文汉字特征识别
+function isJapaneseAnime(anime) {
+  const name = anime.name || '';
+
+  // 0. 国漫关键词黑名单
+  for (const pattern of CN_NAME_PATTERNS) {
+    if (name.includes(pattern)) return false;
+  }
+
+  // 1. 含假名（平假名/片假名）→ 日漫
+  if (/[\u3040-\u309f\u30a0-\u30ff]/.test(name)) return true;
+
+  // 2. 含日文新字体汉字 → 日漫
+  const jpChars = '\u4f1d\u6226\u8a08\u8a18\u8a8c\u8f29\u5909\u6c17\u5e30\u697d\u85ac\u56f3\u5fdc\u58ca\u7d99\u7d4c\u5e83\u6ca2\u7adc\u8ee2\u52f2\u61f2\u62e1\u4fa1\u99c6\u9a39\u8535\u60aa\u5869\u89a7\u91c8\u96d1\u6383\u5263\u770c\u71b1\u767a\u6e80\u4e21\u4e57\u6765\u4fa1\u6e08\u899a\u69d8';
+  for (const ch of jpChars) {
+    if (name.includes(ch)) return true;
+  }
+
+  // 3. 含简体中文专用字 → 国漫，排除
+  const cnChars = '\u6218\u7eaa\u8bb0\u8ff9\u836f\u9976\u56fe\u4f20\u8f88\u53d8\u5f52\u4e50\u51fb\u7ee7\u7ecf\u5e94\u574f\u5e7f\u4ef7\u6269\u9f99\u6cfd\u8f6c\u8bf4\u8ba9\u8fc7\u7ed9\u65f6\u4e2a\u4eec\u8fd9\u8bdd\u5267\u573a\u73b0\u53d1\u95e8\u5173\u95ed\u5f00\u8bba\u8bc6\u8bbe\u8ba4\u4f24\u70e7\u51b2\u949f\u955c\u94c1\u94b1\u94f6\u94dc\u5bfb\u8e2a\u6eda\u6363\u575a\u5458\u542c\u4e60\u60ef\u6bd5\u4e1a\u519c\u5e93\u6d4f\u89c8\u5386\u5b9d\u6ca1';
+  for (const ch of cnChars) {
+    if (name.includes(ch)) return false;
+  }
+
+  // 4. 纯拉丁字符 → 非日漫，排除
+  if (/^[a-zA-Z0-9\s\-:!?(),.&]+$/.test(name)) return false;
+
+  // 5. 其余模糊情况默认保留
+  return true;
+}
+
+// 缺失中文名的番剧翻译表（按 Bangumi subject ID）
+const TITLE_CN_OVERRIDE = {
+  498559: '安第斯电波',
+  688204: '小优家！来自游八',
+  708080: '恶搞之家：万圣特辑',
+  505550: '暗黑机甲 动画版',
+  709326: '基芙：惊叫作家',
+  701779: '马真丘',
+  709475: '软糖皮约 第二季',
+  700127: '小小危城',
+  704737: '森林家族 菲蕾的多彩日常',
+  559080: '梦境之地',
+  637206: '小白炭',
+  694622: '鼠小弟的背心 第二季',
+  701565: '奋斗族',
+  646586: '软软弹弹 第四季',
+  661278: '轻松图鉴',
+  698032: '用鼠标操作现实，所以疯狂点击女孩子',
+  708612: '和暗黑召唤师在一起了 动画剧场',
+};
+
+// ==================== 工具函数 ====================
+
+function getTodayIndex() {
+  const jsDay = new Date().getDay(); // 0=周日
+  return jsDay === 0 ? 6 : jsDay - 1; // 转为 周一=0
+}
+
+// 获取番剧中文名：优先翻译表，其次 name_cn，最后 name
+function getAnimeTitle(anime) {
+  if (TITLE_CN_OVERRIDE[anime.id]) return TITLE_CN_OVERRIDE[anime.id];
+  return anime.name_cn || anime.name || '未知标题';
+}
+
+// 获取封面图候选：本地 covers/ 优先，加载失败时回退到 Bangumi 原图
+function getCoverUrls(anime) {
+  const images = anime.images || {};
+  return {
+    local: `covers/${anime.id}.jpg`,
+    remote: images.large || images.common || images.medium || '',
+  };
+}
+
+// 根据开播日期计算当前更新到第几集（假设每周更新一集，作为无剧集表时的兜底）
+function getCurrentEpisode(airDate) {
+  if (!airDate) return 0;
+  const start = new Date(airDate + 'T00:00:00');
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  if (today < start) return 0; // 还没开播
+
+  const daysDiff = Math.floor((today - start) / 86400000);
+  return Math.floor(daysDiff / 7) + 1;
+}
+
+// 依据剧集表精确计算当前更新到第几集：取"已播出日期 <= 今天"的最后一集
+// 能正确反映停播、特番、延期等情况（日期缺失的集跳过）
+function getCurrentEpisodeFromSchedule(eps) {
+  if (!Array.isArray(eps) || eps.length === 0) return 0;
+  const now = new Date();
+  const todayStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  let aired = 0;
+  for (const ep of eps) {
+    if (!Array.isArray(ep) || ep.length < 2) continue;
+    const [num, date] = ep;
+    if (typeof date === 'string' && date && date <= todayStr && num > aired) aired = num;
+  }
+  return aired;
+}
+
+// ==================== API 请求 ====================
+
+async function fetchAnimeData(timeoutMs = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(BANGUMI_API, {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (compatible; AnimeTracker/1.0)',
+      },
+      signal: controller.signal,
+    });
+
+    if (!response.ok) throw new Error(`接口请求失败：${response.status}`);
+    return await response.json();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// 读取本地数据快照（同源静态文件，Bangumi 不可达时也能用）
+async function fetchSnapshot() {
+  try {
+    const res = await fetch(`${SNAPSHOT_URL}?v=${Date.now()}`, { cache: 'no-store' });
+    if (!res.ok) return null;
+    const json = await res.json();
+    return Array.isArray(json.days) && json.days.length > 0
+      ? { updatedAt: json.updatedAt || '', days: json.days }
+      : null;
+  } catch {
+    // 快照不存在（未生成）或本地 file:// 打开时失败，降级为仅实时接口
+    return null;
+  }
+}
+
+// ==================== 数据处理 ====================
+
+// Bangumi 返回的 weekday.id: 1=周一, 2=周二, ..., 7=周日
+// 转为我们的索引: 0=周一, ..., 6=周日
+function getGroupsFromApi(apiData) {
+  const groups = [[], [], [], [], [], [], []];
+  for (const dayData of apiData) {
+    const idx = dayData.weekday.id - 1; // 1->0, ..., 7->6
+    groups[idx] = dayData.items || [];
+  }
+  return groups;
+}
+
+// ==================== 渲染：周几标签栏 ====================
+
+function renderWeekdayNav() {
+  const nav = document.querySelector('#weekday-nav > div');
+  nav.innerHTML = '';
+  const todayIdx = getTodayIndex();
+
+  WEEKDAYS.forEach((wd, i) => {
+    const btn = document.createElement('button');
+    btn.className = 'weekday-tab flex-1 min-w-[3rem] py-2.5 text-sm font-medium transition-all duration-200';
+    btn.dataset.day = i;
+
+    const isToday = i === todayIdx;
+    btn.innerHTML = `
+      <span class="block">${wd.cn}</span>
+      <span class="block text-[10px] mt-0.5 day-count text-zinc-500"></span>
+      ${isToday ? '<span class="block text-[9px] mt-0.5 text-amber-400">今天</span>' : ''}
+    `;
+
+    btn.onclick = () => selectDay(i);
+    nav.appendChild(btn);
+  });
+}
+
+function updateWeekdayCounts(groups) {
+  const tabs = document.querySelectorAll('.weekday-tab');
+  tabs.forEach((tab, i) => {
+    const countEl = tab.querySelector('.day-count');
+    // 只统计日漫
+    const jpList = groups[i].filter(isJapaneseAnime);
+    const visibleList = filterVisible(groups[i]);
+    const count = visibleList.length;
+    countEl.textContent = count > 0 ? `${count}部` : '—';
+    const isActive = i === selectedDay;
+    tab.classList.toggle('active', isActive);
+  });
+}
+
+// ==================== 渲染：番剧卡片 ====================
+
+function renderAnimeCard(anime) {
+  const title = getAnimeTitle(anime);
+  const covers = getCoverUrls(anime);
+  const detailUrl = getDetailUrl(anime);
+  const hasCustomLink = !!getLinkOverrides()[anime.id];
+  const airDate = anime.air_date || '';
+
+  // 计算当前集数（支持手动覆盖）：优先用剧集表的真实播出日期，缺失时回退开播日期估算
+  const schedule = (Array.isArray(anime.eps) && anime.eps.length)
+    ? anime.eps
+    : (snapshotSchedules && snapshotSchedules.get(anime.id)) || null;
+  const autoEp = schedule ? getCurrentEpisodeFromSchedule(schedule) : getCurrentEpisode(airDate);
+  const overrideEp = getEpisodeOverrides()[anime.id] || 0;
+  const currentEp = overrideEp || autoEp;
+  const isManual = overrideEp > 0;
+
+  return `
+    <div class="anime-card group relative rounded-xl overflow-hidden bg-white/5 border border-white/10 backdrop-blur-sm">
+      <div class="absolute top-2 right-2 z-10 flex gap-1 opacity-0 group-hover:opacity-100 transition-all">
+        <button class="w-7 h-7 rounded-full bg-black/60 hover:bg-zinc-700/80 backdrop-blur-sm text-xs flex items-center justify-center transition-all"
+                onclick="toggleHide(${anime.id})" title="隐藏此番剧">
+          🚫
+        </button>
+        <button class="w-7 h-7 rounded-full bg-black/60 hover:bg-red-600 backdrop-blur-sm text-xs flex items-center justify-center transition-all"
+                onclick="deleteAnime(${anime.id})" title="删除此番剧">
+          🗑
+        </button>
+        <button class="w-7 h-7 rounded-full bg-black/60 hover:bg-amber-500/80 backdrop-blur-sm text-xs flex items-center justify-center transition-all"
+                data-link-edit="${anime.id}" onclick="editLink(${anime.id})" title="${hasCustomLink ? '修改自定义链接' : '设置自定义链接（留空恢复默认）'}">
+          🔗
+        </button>
+      </div>
+      <div class="cover-container aspect-[3/4] bg-zinc-800">
+        <a href="${detailUrl}" target="_blank" rel="noopener noreferrer" class="block w-full h-full" aria-label="${title}">
+          ${covers.remote
+            ? `<img src="${covers.local}" alt="${title}" loading="lazy" class="w-full h-full object-cover" onerror="this.onerror=null;this.src='${covers.remote}'" />`
+            : `<div class="w-full h-full flex items-center justify-center text-zinc-600 text-4xl">📺</div>`
+          }
+        </a>
+        ${currentEp > 0 ? `
+          <button type="button" title="点击修改集数（留空恢复自动）" data-ep-edit="${anime.id}"
+                  class="absolute bottom-2 left-2 px-2 py-1 rounded-md bg-black/70 backdrop-blur-sm text-xs font-semibold text-amber-300 hover:bg-zinc-900/80 hover:ring-1 hover:ring-amber-500/60 transition-all"
+                  onclick="editEpisode(${anime.id}, ${autoEp})">
+            更新至第${currentEp}集${isManual ? ' ✏️' : ''}
+          </button>` : ''}
+      </div>
+      <div class="p-3">
+        <h3 class="font-semibold text-sm leading-tight mb-2 line-clamp-2">
+          <a href="${detailUrl}" target="_blank" rel="noopener noreferrer" class="group-hover:text-amber-300 transition-colors">${title}${hasCustomLink ? ' <span class="text-amber-300" title="自定义链接">🔗</span>' : ''}</a>
+        </h3>
+        ${currentEp > 0 ? `<p class="text-xs text-amber-300">更新至第${currentEp}集</p>` : ''}
+      </div>
+    </div>
+  `;
+}
+
+// ==================== 集数编辑 ====================
+
+function editEpisode(id, autoEp) {
+  const btn = document.querySelector(`[data-ep-edit="${id}"]`);
+  if (!btn) return;
+
+  const overrides = getEpisodeOverrides();
+  const input = document.createElement('input');
+  input.type = 'number';
+  input.min = '0';
+  input.step = '1';
+  input.max = '9999';
+  input.className = 'w-20 px-2 py-1 rounded-md bg-black/70 backdrop-blur-sm text-xs font-semibold text-amber-300 outline-none ring-1 ring-amber-500/60';
+  input.value = overrides[id] != null ? overrides[id] : (autoEp || '');
+  input.placeholder = autoEp > 0 ? `自动 ${autoEp}` : '自动';
+  input.title = '输入集数，留空=恢复自动；回车保存 / Esc 取消';
+
+  let finished = false;
+  const finish = (save) => {
+    if (finished) return;
+    finished = true;
+    if (save) {
+      const v = parseInt(input.value, 10);
+      setEpisodeOverride(id, Number.isFinite(v) && v >= 0 && v <= 9999 ? v : 0);
+    }
+    if (cachedData) {
+      updateWeekdayCounts(cachedData);
+      renderDay(cachedData);
+    }
+  };
+
+  input.addEventListener('blur', () => finish(true));
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  });
+
+  btn.replaceWith(input);
+  input.focus();
+  input.select();
+}
+
+// ==================== 渲染：当天内容 ====================
+
+function renderDay(groups) {
+  const container = document.getElementById('day-container');
+  const wd = WEEKDAYS[selectedDay];
+  const allList = groups[selectedDay];
+  const animeList = filterVisible(allList);
+  const todayIdx = getTodayIndex();
+  const isToday = selectedDay === todayIdx;
+
+  // 响应式：电脑 5 列，平板 4 列，手机 2 列
+  const gridCols = 'grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3';
+
+  container.innerHTML = `
+    <div class="day-column">
+      <div class="flex items-center gap-2 mb-4">
+        <div class="w-8 h-8 rounded-lg flex items-center justify-center text-sm font-bold text-zinc-200 bg-zinc-800">
+        </div>
+        <div>
+          <h2 class="font-bold text-base ${isToday ? 'text-amber-400' : ''}">
+            ${wd.cn}
+            ${isToday ? '<span class="text-xs ml-1 px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 align-middle">今天</span>' : ''}
+          </h2>
+          <p class="text-xs text-zinc-500">${animeList.length} 部更新</p>
+        </div>
+      </div>
+      <div class="${gridCols}">
+        ${animeList.length === 0
+          ? `<div class="col-span-full text-center py-12 text-zinc-600 text-sm">🍃 本日无更新</div>`
+          : animeList.map(renderAnimeCard).join('')}
+      </div>
+    </div>
+  `;
+}
+
+// ==================== 切换天 ====================
+
+function selectDay(idx) {
+  selectedDay = idx;
+  if (cachedData) {
+    const groups = cachedData;
+    updateWeekdayCounts(groups);
+    renderDay(groups);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+}
+
+// ==================== 状态管理 ====================
+
+function showLoading(show) {
+  document.getElementById('loading').classList.toggle('hidden', !show);
+}
+
+function showError(msg) {
+  document.getElementById('error-state').classList.remove('hidden');
+  document.getElementById('error-msg').textContent = msg || '请稍后重试';
+  document.getElementById('empty-state').classList.add('hidden');
+}
+
+function hideAllStates() {
+  document.getElementById('error-state').classList.add('hidden');
+  document.getElementById('empty-state').classList.add('hidden');
+}
+
+// ==================== 管理弹窗 ====================
+
+function openManageModal() {
+  const modal = document.getElementById('manage-modal');
+  const list = document.getElementById('manage-list');
+  const hidden = getHiddenIds();
+  const deleted = getDeletedIds();
+
+  // 收集所有番剧（仅日漫，未删除的）
+  const allAnime = cachedData ? cachedData.flat().filter(isJapaneseAnime) : [];
+  const visibleAnime = allAnime.filter(a => !deleted.has(a.id));
+
+  let html = '';
+
+  if (visibleAnime.length === 0) {
+    html = '<p class="text-zinc-500 text-center py-4 text-sm">暂无番剧</p>';
+  } else {
+    html = visibleAnime.map(anime => {
+      const title = getAnimeTitle(anime);
+      const covers = getCoverUrls(anime);
+      const isHidden = hidden.has(anime.id);
+      const publishedHidden = remoteConfig.hidden.includes(anime.id);
+      const weekday = anime.air_weekday ? WEEKDAYS[anime.air_weekday - 1].cn : '';
+      return `
+        <div class="flex items-center gap-3 p-2 rounded-lg ${isHidden ? 'bg-zinc-500/10 opacity-60' : 'bg-white/5'} transition-all">
+          <img src="${covers.local}" alt="${title}" class="w-10 h-14 rounded object-cover flex-shrink-0" loading="lazy" onerror="this.onerror=null;this.src='${covers.remote}'" />
+          <div class="flex-1 min-w-0">
+            <p class="text-sm font-medium truncate">${title}</p>
+            <p class="text-xs text-zinc-500">${weekday}更新${publishedHidden ? ' · 已发布隐藏' : ''}</p>
+          </div>
+          <div class="flex gap-1">
+            ${publishedHidden
+              ? `<span class="px-2 py-1.5 rounded-lg text-xs bg-zinc-500/20 text-zinc-400" title="已写入 excluded.json，需编辑该文件并推送才能显示">📌 需改文件</span>`
+              : `<button
+                   class="px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all ${isHidden ? 'bg-green-500/20 text-green-400 hover:bg-green-500/30' : 'bg-zinc-500/20 text-zinc-300 hover:bg-zinc-500/30'}"
+                   onclick="toggleHide(${anime.id}); openManageModal();"
+                 >
+                   ${isHidden ? '👁 显示' : '🚫 隐藏'}
+                 </button>`
+            }
+            <button
+              class="px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all bg-red-500/20 text-red-400 hover:bg-red-500/30"
+              onclick="deleteAnime(${anime.id}); openManageModal();"
+            >
+              🗑 删除
+            </button>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
+
+  list.innerHTML = html;
+  modal.classList.remove('hidden');
+}
+
+function closeManageModal() {
+  document.getElementById('manage-modal').classList.add('hidden');
+}
+
+// ==================== 回收站弹窗 ====================
+
+function openTrashModal() {
+  const modal = document.getElementById('trash-modal');
+  const list = document.getElementById('trash-list');
+  const deleted = getDeletedIds();
+
+  // 收集已删除的番剧（仅日漫）
+  const allAnime = cachedData ? cachedData.flat().filter(isJapaneseAnime) : [];
+  const deletedAnime = allAnime.filter(a => deleted.has(a.id));
+
+  let html = '';
+
+  if (deletedAnime.length === 0) {
+    html = '<p class="text-zinc-500 text-center py-8 text-sm">🗑 回收站为空</p>';
+  } else {
+    html = deletedAnime.map(anime => {
+      const title = getAnimeTitle(anime);
+      const covers = getCoverUrls(anime);
+      const weekday = anime.air_weekday ? WEEKDAYS[anime.air_weekday - 1].cn : '';
+      const isPublished = remoteConfig.deleted.includes(anime.id);
+      return `
+        <div class="flex items-center gap-3 p-2 rounded-lg bg-red-500/5 opacity-50 transition-all">
+          <img src="${covers.local}" alt="${title}" class="w-10 h-14 rounded object-cover flex-shrink-0 grayscale" loading="lazy" onerror="this.onerror=null;this.src='${covers.remote}'" />
+          <div class="flex-1 min-w-0">
+            <p class="text-sm font-medium truncate">${title}</p>
+            <p class="text-xs text-zinc-500">${weekday}更新${isPublished ? ' · 已发布' : ''}</p>
+          </div>
+          ${isPublished
+            ? `<span class="px-2 py-1 rounded-lg text-xs bg-zinc-500/20 text-zinc-400" title="已写入 excluded.json，需编辑该文件并推送才能恢复">📌 需改文件</span>`
+            : `<button
+                 class="px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all bg-green-500/20 text-green-400 hover:bg-green-500/30"
+                 onclick="restoreAnime(${anime.id})"
+               >
+                 ♻ 恢复
+               </button>`
+          }
+        </div>
+      `;
+    }).join('');
+  }
+
+  list.innerHTML = html;
+  modal.classList.remove('hidden');
+}
+
+function closeTrashModal() {
+  document.getElementById('trash-modal').classList.add('hidden');
+}
+
+// ==================== 发布配置 ====================
+
+function buildPublishConfig() {
+  return {
+    deleted: [...getDeletedIds()].sort((a, b) => a - b),
+    hidden: [...getHiddenIds()].sort((a, b) => a - b),
+    episodeOverride: getEpisodeOverrides(),
+    linkOverride: getLinkOverrides(),
+  };
+}
+
+function openPublishModal() {
+  document.getElementById('publish-text').value = JSON.stringify(buildPublishConfig(), null, 2);
+  document.getElementById('publish-modal').classList.remove('hidden');
+}
+
+function closePublishModal() {
+  document.getElementById('publish-modal').classList.add('hidden');
+}
+
+async function copyPublishConfig() {
+  const textarea = document.getElementById('publish-text');
+  try {
+    await navigator.clipboard.writeText(textarea.value);
+    alert('已复制！粘贴覆盖仓库里的 excluded.json，再 commit & push 即可。');
+  } catch {
+    textarea.select();
+    document.execCommand('copy');
+    alert('已复制（备用方式）！粘贴覆盖仓库里的 excluded.json，再 commit & push 即可。');
+  }
+}
+
+// ==================== 主流程 ====================
+
+// 将 API/快照数据渲染到页面，返回番剧总数
+function applyData(apiData) {
+  const groups = getGroupsFromApi(apiData);
+  cachedData = groups;
+  updateWeekdayCounts(groups);
+  renderDay(groups);
+  return groups.reduce((sum, g) => sum + g.length, 0);
+}
+
+// 页脚的数据日期提示：使用快照时显示快照日期，实时数据时不显示
+function showDataDate(updatedAt) {
+  const el = document.getElementById('data-date');
+  if (!el) return;
+  if (updatedAt) {
+    el.textContent = `数据更新于 ${String(updatedAt).slice(0, 10)}`;
+    el.classList.remove('hidden');
+  } else {
+    el.textContent = '';
+    el.classList.add('hidden');
+  }
+}
+
+async function loadData() {
+  showLoading(true);
+  hideAllStates();
+
+  try {
+    await loadRemoteConfig();
+
+    // 1) 先用本地快照渲染：Bangumi 不可达时也能立即显示，首屏也更快
+    const snapshot = await fetchSnapshot();
+    let total = 0;
+    if (snapshot) {
+      snapshotSchedules = new Map();
+      for (const day of snapshot.days) {
+        for (const it of (day && day.items) || []) {
+          if (it && Array.isArray(it.eps) && it.eps.length) snapshotSchedules.set(it.id, it.eps);
+        }
+      }
+      total = applyData(snapshot.days);
+      showDataDate(snapshot.updatedAt);
+      showLoading(false);
+    }
+
+    // 2) 后台尝试实时接口：成功则静默替换为最新数据，失败则继续用快照
+    try {
+      const apiData = await fetchAnimeData();
+      total = applyData(apiData);
+      showDataDate('');
+    } catch (err) {
+      console.warn('实时接口不可用，使用本地快照：', err);
+      if (!snapshot) throw err;
+    }
+
+    if (total === 0) {
+      document.getElementById('empty-state').classList.remove('hidden');
+    }
+  } catch (err) {
+    console.error('加载失败：', err);
+    showError(err.message);
+  } finally {
+    showLoading(false);
+  }
+}
+
+// 初始化
+document.addEventListener('DOMContentLoaded', () => {
+  selectedDay = getTodayIndex(); // 默认选中今天
+  renderWeekdayNav();
+  loadData();
+
+  document.getElementById('refresh-btn').addEventListener('click', loadData);
+  document.getElementById('manage-btn').addEventListener('click', openManageModal);
+  document.getElementById('manage-close').addEventListener('click', closeManageModal);
+  document.getElementById('manage-modal').addEventListener('click', (e) => {
+    if (e.target.id === 'manage-modal') closeManageModal();
+  });
+
+  document.getElementById('trash-btn').addEventListener('click', openTrashModal);
+  document.getElementById('trash-close').addEventListener('click', closeTrashModal);
+  document.getElementById('trash-modal').addEventListener('click', (e) => {
+    if (e.target.id === 'trash-modal') closeTrashModal();
+  });
+
+  document.getElementById('publish-btn').addEventListener('click', openPublishModal);
+  document.getElementById('publish-close').addEventListener('click', closePublishModal);
+  document.getElementById('publish-modal').addEventListener('click', (e) => {
+    if (e.target.id === 'publish-modal') closePublishModal();
+  });
+  document.getElementById('publish-copy').addEventListener('click', copyPublishConfig);
+});

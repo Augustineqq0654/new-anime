@@ -1,0 +1,21 @@
+# ===== 本地工具残留 =====
+# OpenCode 会话续跑元数据
+.omo/
+# Playwright MCP 调试日志与页面快照
+.playwright-mcp/
+
+# ===== 日志 =====
+*.log
+
+# ===== 系统文件 =====
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ===== 编辑器 / IDE =====
+.vscode/
+.idea/
+
+# ===== 依赖与临时文件（本项目零依赖，仅作预留）=====
+node_modules/
+*.tmp
