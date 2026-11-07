@@ -48,7 +48,11 @@ async function loadRemoteConfig() {
 
 // ==================== 隐藏/删除列表管理 ====================
 const HIDDEN_KEY = 'anime_hidden_ids';
+// 从「共享配置里已隐藏」的番剧中恢复显示的本地白名单
+const SHOWN_KEY = 'anime_shown_ids';
 const DELETED_KEY = 'anime_deleted_ids';
+// 从「共享配置里已删除」的番剧中恢复的本地白名单
+const RESTORED_KEY = 'anime_restored_ids';
 
 function readLocalSet(key) {
   try {
@@ -64,13 +68,29 @@ function saveDeletedIds(idSet) {
   localStorage.setItem(DELETED_KEY, JSON.stringify([...idSet]));
 }
 
+function getRestoredIds() { return readLocalSet(RESTORED_KEY); }
+function saveRestoredIds(idSet) {
+  localStorage.setItem(RESTORED_KEY, JSON.stringify([...idSet]));
+}
+
+function getShownIds() { return readLocalSet(SHOWN_KEY); }
+function saveShownIds(idSet) {
+  localStorage.setItem(SHOWN_KEY, JSON.stringify([...idSet]));
+}
+
 // 仅本机改动（不含共享配置）
 function getLocalHiddenIds() { return readLocalSet(HIDDEN_KEY); }
 function getLocalDeletedIds() { return readLocalSet(DELETED_KEY); }
 
-// 最终生效 = 共享配置 ∪ 本机改动
-function getHiddenIds() { return new Set([...remoteConfig.hidden, ...getLocalHiddenIds()]); }
-function getDeletedIds() { return new Set([...remoteConfig.deleted, ...getLocalDeletedIds()]); }
+// 最终生效 = 共享配置 ∪ 本机改动；「本机恢复」的优先显示
+function getHiddenIds() {
+  const shown = getShownIds();
+  return new Set([...(remoteConfig.hidden || []), ...getLocalHiddenIds()].filter(id => !shown.has(id)));
+}
+function getDeletedIds() {
+  const restored = getRestoredIds();
+  return new Set([...(remoteConfig.deleted || []), ...getLocalDeletedIds()].filter(id => !restored.has(id)));
+}
 
 // ==================== 集数手动覆盖 ====================
 const EP_OVERRIDE_KEY = 'anime_episode_override';
@@ -136,10 +156,21 @@ function editLink(id) {
 }
 
 function toggleHide(id) {
-  const ids = getLocalHiddenIds();
-  if (ids.has(id)) ids.delete(id);
-  else ids.add(id);
-  saveHiddenIds(ids);
+  const local = getLocalHiddenIds();
+  const shown = getShownIds();
+  const isHiddenNow = getHiddenIds().has(id);
+  if (isHiddenNow) {
+    // 显示：撤掉本机隐藏；若共享配置里也隐藏了，记入本机显示白名单
+    local.delete(id);
+    if ((remoteConfig.hidden || []).includes(id)) shown.add(id);
+    else shown.delete(id);
+  } else {
+    // 隐藏：写入本机隐藏，并清掉显示白名单
+    local.add(id);
+    shown.delete(id);
+  }
+  saveHiddenIds(local);
+  saveShownIds(shown);
   if (cachedData) {
     updateWeekdayCounts(cachedData);
     renderDay(cachedData);
@@ -150,6 +181,9 @@ function deleteAnime(id) {
   const ids = getLocalDeletedIds();
   ids.add(id);
   saveDeletedIds(ids);
+  // 重新删除时取消本机恢复标记
+  const restored = getRestoredIds();
+  if (restored.delete(id)) saveRestoredIds(restored);
   // 同时从隐藏列表中移除
   const hidden = getLocalHiddenIds();
   hidden.delete(id);
@@ -161,9 +195,15 @@ function deleteAnime(id) {
 }
 
 function restoreAnime(id) {
+  // 先撤掉本机删除
   const ids = getLocalDeletedIds();
   ids.delete(id);
   saveDeletedIds(ids);
+  // 若它在共享配置里被删除，则记入本机恢复白名单（本机立即显示；发布配置后对所有人生效）
+  const restored = getRestoredIds();
+  if ((remoteConfig.deleted || []).includes(id)) restored.add(id);
+  else restored.delete(id);
+  saveRestoredIds(restored);
   if (cachedData) {
     updateWeekdayCounts(cachedData);
     renderDay(cachedData);
@@ -565,18 +605,15 @@ function openManageModal() {
           <img src="${covers.local}" alt="${title}" class="w-10 h-14 rounded object-cover flex-shrink-0" loading="lazy" onerror="this.onerror=null;this.src='${covers.remote}'" />
           <div class="flex-1 min-w-0">
             <p class="text-sm font-medium truncate">${title}</p>
-            <p class="text-xs text-zinc-500">${weekday}更新${publishedHidden ? ' · 已发布隐藏' : ''}</p>
+            <p class="text-xs text-zinc-500">${weekday}更新${publishedHidden ? ' · 已发布隐藏（显示后需发布配置才对所有人生效）' : ''}</p>
           </div>
           <div class="flex gap-1">
-            ${publishedHidden
-              ? `<span class="px-2 py-1.5 rounded-lg text-xs bg-zinc-500/20 text-zinc-400" title="已写入 excluded.json，需编辑该文件并推送才能显示">📌 需改文件</span>`
-              : `<button
+            <button
                    class="px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all ${isHidden ? 'bg-green-500/20 text-green-400 hover:bg-green-500/30' : 'bg-zinc-500/20 text-zinc-300 hover:bg-zinc-500/30'}"
                    onclick="toggleHide(${anime.id}); openManageModal();"
                  >
                    ${isHidden ? '👁 显示' : '🚫 隐藏'}
-                 </button>`
-            }
+                 </button>
             <button
               class="px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all bg-red-500/20 text-red-400 hover:bg-red-500/30"
               onclick="deleteAnime(${anime.id}); openManageModal();"
@@ -623,17 +660,14 @@ function openTrashModal() {
           <img src="${covers.local}" alt="${title}" class="w-10 h-14 rounded object-cover flex-shrink-0 grayscale" loading="lazy" onerror="this.onerror=null;this.src='${covers.remote}'" />
           <div class="flex-1 min-w-0">
             <p class="text-sm font-medium truncate">${title}</p>
-            <p class="text-xs text-zinc-500">${weekday}更新${isPublished ? ' · 已发布' : ''}</p>
+            <p class="text-xs text-zinc-500">${weekday}更新${isPublished ? ' · 已发布（恢复后需发布配置才对所有人生效）' : ''}</p>
           </div>
-          ${isPublished
-            ? `<span class="px-2 py-1 rounded-lg text-xs bg-zinc-500/20 text-zinc-400" title="已写入 excluded.json，需编辑该文件并推送才能恢复">📌 需改文件</span>`
-            : `<button
-                 class="px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all bg-green-500/20 text-green-400 hover:bg-green-500/30"
-                 onclick="restoreAnime(${anime.id})"
-               >
-                 ♻ 恢复
-               </button>`
-          }
+          <button
+            class="px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all bg-green-500/20 text-green-400 hover:bg-green-500/30"
+            onclick="restoreAnime(${anime.id})"
+          >
+            ♻ 恢复
+          </button>
         </div>
       `;
     }).join('');
