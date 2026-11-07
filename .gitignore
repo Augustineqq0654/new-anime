@@ -7,6 +7,12 @@
 # ===== 日志 =====
 *.log
 
+# ===== 私有目录 / 登录态（永不提交）=====
+# _private/ 放夸克网盘转存脚本、Cookie、源链接等不公开内容
+_private/
+data/quark-cookie.txt
+data/quark-reshare-state.json
+
 # ===== 系统文件 =====
 Thumbs.db
 Desktop.ini

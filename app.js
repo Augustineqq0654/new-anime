@@ -110,15 +110,20 @@ function setLinkOverride(id, url) {
   localStorage.setItem(LINK_OVERRIDE_KEY, JSON.stringify(map));
 }
 
+function getBangumiUrl(anime) {
+  return (anime.url || `https://bgm.tv/subject/${anime.id}`).replace(/^http:/, 'https:');
+}
+
+// 封面用：有自定义链接（网盘）就跳网盘，否则回退 Bangumi
 function getDetailUrl(anime) {
   const custom = getLinkOverrides()[anime.id];
   if (custom) return custom;
-  return (anime.url || `https://bgm.tv/subject/${anime.id}`).replace(/^http:/, 'https:');
+  return getBangumiUrl(anime);
 }
 
 function editLink(id) {
   const overrides = getLinkOverrides();
-  const input = prompt('设置自定义链接（需以 http:// 或 https:// 开头；留空或取消=恢复默认 Bangumi 链接）：', overrides[id] || '');
+  const input = prompt('设置封面跳转链接（需以 http:// 或 https:// 开头；留空或取消 = 封面恢复 Bangumi）：', overrides[id] || '');
   if (input === null) return;
   if ((input || '').trim() !== '' && !/^https?:\/\//i.test((input || '').trim())) {
     alert('链接无效，已恢复默认。链接需以 http:// 或 https:// 开头。');
@@ -371,7 +376,8 @@ function updateWeekdayCounts(groups) {
 function renderAnimeCard(anime) {
   const title = getAnimeTitle(anime);
   const covers = getCoverUrls(anime);
-  const detailUrl = getDetailUrl(anime);
+  const detailUrl = getDetailUrl(anime);   // 封面：自定义链接优先
+  const bangumiUrl = getBangumiUrl(anime); // 标题：永远跳 Bangumi 条目页
   const hasCustomLink = !!getLinkOverrides()[anime.id];
   const airDate = anime.air_date || '';
 
@@ -396,12 +402,13 @@ function renderAnimeCard(anime) {
           🗑
         </button>
         <button class="w-7 h-7 rounded-full bg-black/60 hover:bg-amber-500/80 backdrop-blur-sm text-xs flex items-center justify-center transition-all"
-                data-link-edit="${anime.id}" onclick="editLink(${anime.id})" title="${hasCustomLink ? '修改自定义链接' : '设置自定义链接（留空恢复默认）'}">
+                data-link-edit="${anime.id}" onclick="editLink(${anime.id})" title="${hasCustomLink ? '修改封面跳转链接' : '设置封面跳转链接（留空恢复 Bangumi）'}">
           🔗
         </button>
       </div>
       <div class="cover-container aspect-[3/4] bg-zinc-800">
-        <a href="${detailUrl}" target="_blank" rel="noopener noreferrer" class="block w-full h-full" aria-label="${title}">
+        <a href="${detailUrl}" target="_blank" rel="noopener noreferrer" class="block w-full h-full"
+           aria-label="${title}" title="${hasCustomLink ? '打开网盘资源' : '打开 Bangumi 条目页'}">
           ${covers.remote
             ? `<img src="${covers.local}" alt="${title}" loading="lazy" class="w-full h-full object-cover" onerror="this.onerror=null;this.src='${covers.remote}'" />`
             : `<div class="w-full h-full flex items-center justify-center text-zinc-600 text-4xl">📺</div>`
@@ -416,7 +423,7 @@ function renderAnimeCard(anime) {
       </div>
       <div class="p-3">
         <h3 class="font-semibold text-sm leading-tight mb-2 line-clamp-2">
-          <a href="${detailUrl}" target="_blank" rel="noopener noreferrer" class="group-hover:text-amber-300 transition-colors">${title}${hasCustomLink ? ' <span class="text-amber-300" title="自定义链接">🔗</span>' : ''}</a>
+          <a href="${bangumiUrl}" target="_blank" rel="noopener noreferrer" class="group-hover:text-amber-300 transition-colors">${title}${hasCustomLink ? ' <span class="text-amber-300" title="封面可跳自定义链接">🔗</span>' : ''}</a>
         </h3>
         ${currentEp > 0 ? `<p class="text-xs text-amber-300">更新至第${currentEp}集</p>` : ''}
       </div>
